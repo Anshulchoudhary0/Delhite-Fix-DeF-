@@ -1,3 +1,26 @@
+"""
+DelhiFix Web Application Interface.
+
+Single Responsibility:
+  Serves as the user interface (UI) and frontend layer for the DelhiFix 
+  civic grievance pipeline. It runs a Gradio server featuring premium custom CSS, 
+  real-time AQI tracking, and distinct flows for filing new grievances vs escalating 
+  unresolved issues.
+
+Inputs:
+  - Interactive user inputs: text descriptions, location, file uploads (photos), 
+    and days pending.
+
+Outputs:
+  - Premium styled HTML pages, status badges, complaint draft boxes, 
+    one-click Gmail web compose links, and AQI widgets.
+
+DelhiFix Pipeline Context:
+  Binds the Gradio UI directly to the multi-agent Coordinator Agent runner. 
+  It handles session creation, serializes input parameters into JSON payloads 
+  for the coordinator, and handles visual response rendering and error handling.
+"""
+
 import sys
 import os
 import json
@@ -6,6 +29,10 @@ from urllib.parse import parse_qs, quote
 # pyrefly: ignore [missing-import]
 import gradio as gr
 
+# Design Decision - Gmail Redirect:
+# Traditional mailto: links often open broken or unconfigured native desktop mail clients. 
+# We convert mailto links to direct Gmail web compose URLs to guarantee a smooth, 
+# zero-friction submission flow directly in the resident's web browser.
 def convert_mailto_to_gmail(mailto_url):
     if not mailto_url or not mailto_url.startswith("mailto:"):
         return ""
@@ -407,6 +434,10 @@ footer { display: none !important; }
 
 # ── Initialize ADK Runner ───────────────────────────────────────────────────
 
+# Design Decision - Session Isolation:
+# We maintain an in-memory session service. Each user request triggers the creation of 
+# a unique, isolated session context. This keeps user history private and prevents 
+# multi-user requests from leaking information into other active sessions.
 session_service = InMemorySessionService()
 app_runner = Runner(
     agent=coordinator_agent,
@@ -414,11 +445,18 @@ app_runner = Runner(
     session_service=session_service
 )
 
+# Design Decision - Cross-Request State for Duplicate Protection:
+# Although user sessions are isolated, we store successfully drafted reports in a global 
+# in-memory list (active_reports) and feed them to duplicate check calls. This permits the 
+# system to flag duplicate civic issues filed by different users during the application's runtime.
 active_reports = []
 
 
 # ── Handler Functions ────────────────────────────────────────────────────────
 
+# Behavior:
+# Validates parameters, initializes a secure ADK session, runs the coordinator agent 
+# asynchronously, and processes final outputs to render the UI badges and Gmail compose link.
 async def handle_new_complaint(issue_description, location, image_path):
     if not issue_description and not image_path:
         return "N/A", "N/A", "N/A", "Please provide a description or upload an image.", "", ""
@@ -428,6 +466,8 @@ async def handle_new_complaint(issue_description, location, image_path):
     try:
         session = await app_runner.session_service.create_session(app_name=coordinator_agent.name, user_id="web_user")
         
+        # Implementation: Pack input parameters into a structured JSON payload string 
+        # that the coordinator agent expects.
         payload = {
             "issue_description": issue_description or "",
             "location": location or "Delhi",
@@ -516,6 +556,10 @@ async def handle_new_complaint(issue_description, location, image_path):
         else:
             return "N/A", "N/A", "N/A", "No structured output received. Response:\n" + final_text, "", ""
     except Exception as e:
+        # Design Decision - UI Error Boundaries:
+        # Rather than displaying technical raw traceback exceptions directly to the resident, 
+        # we catch rate limits (429) and server overloads (503) and translate them into 
+        # actionable instructions (e.g. "wait a few seconds and submit again").
         err_str = str(e)
         if "503" in err_str or "UNAVAILABLE" in err_str:
             user_msg = "The AI model is currently experiencing extremely high demand. Please wait a few seconds and try submitting again."
@@ -614,6 +658,10 @@ async def handle_escalation(complaint_text, days_pending):
 
 # ── Live AQI Widget ──────────────────────────────────────────────────────────
 
+# Design Decision - Live Environmental Context:
+# We fetch live air quality metrics for Delhi (using open Open-Meteo Air Quality API coordinates). 
+# Showing real-time PM2.5 levels directly above the filing form emphasizes the civic and 
+# environmental priority of filing grievances (like garbage burning or construction dust).
 def get_current_delhi_aqi_html():
     import requests
     url = "https://air-quality-api.open-meteo.com/v1/air-quality"

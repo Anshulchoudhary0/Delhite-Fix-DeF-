@@ -1,3 +1,24 @@
+"""
+Guardrail Module for DelhiFix.
+
+Single Responsibility:
+  Screens incoming resident reports for inappropriate language, profanity, 
+  harassment, or off-topic spam (e.g. programming queries, cooking recipes) 
+  before inputs reach the multi-agent drafting pipeline.
+
+Inputs:
+  - Raw complaint text.
+
+Outputs:
+  - (is_valid, rejection_reason): Tuple[bool, str].
+    * is_valid: True if input is appropriate and civic-related.
+    * rejection_reason: Descriptive rejection string on failure.
+
+DelhiFix Pipeline Context:
+  Acts as a gatekeeper executed by the Coordinator Agent early in the execution flow.
+  Blocks execution if the report fails validation, returning an early rejection.
+"""
+
 import os
 import json
 import asyncio
@@ -8,6 +29,9 @@ from google.genai import types
 
 _client = None
 
+# Design Decision - Lazy Initialization:
+# Clients are instantiated only on demand to prevent import-time exceptions 
+# if environmental API keys are missing or invalid during startup.
 def _get_client():
     global _client
     if _client is None:
@@ -28,7 +52,9 @@ async def validate_report(text: str) -> tuple[bool, str]:
     if len(cleaned_text) < 4:
         return False, "The report content is too short (must be at least 4 characters)."
         
-    # Static check for common offensive words
+    # Design Decision - Hybrid Validation:
+    # First, run a static check for common profanities. This executes with zero latency
+    # and protects the API from unnecessary calls.
     import string
     profanities = {"fuck", "shit", "bitch", "asshole", "idiot", "bastard", "abuse"}
     words = [w.strip(string.punctuation) for w in cleaned_text.lower().split()]
@@ -37,10 +63,16 @@ async def validate_report(text: str) -> tuple[bool, str]:
         
     client = _get_client()
     if not client:
-        # If no API key, fallback to allowing the report to proceed to avoid blocking
+        # Failsafe Decision:
+        # If the client cannot be initialized (e.g., missing API key), we fail-open 
+        # to prevent locking out all user interaction.
         return True, ""
         
     try:
+        # Design Decision - LLM Content Moderation:
+        # The prompt checks for two criteria: (1) offensive content and (2) civic relevance.
+        # This keeps user submissions aligned with municipal infrastructure and public safety, 
+        # filtering out general chit-chat, programming questions, or recipes.
         prompt = f"""
         Analyze this user input text:
         "{cleaned_text}"
@@ -77,6 +109,8 @@ async def validate_report(text: str) -> tuple[bool, str]:
         return True, ""
         
     except Exception as e:
-        # If the API call fails (e.g. rate limit), allow it to pass to the next stage rather than blocking
+        # Failsafe Decision:
+        # If the API call fails (network timeout, rate-limits, etc.), we print a warning 
+        # and allow the report to pass (failsafe open) to avoid locking users out.
         print(f"Warning in guardrail validation API call: {e}")
         return True, ""

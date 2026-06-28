@@ -1,3 +1,23 @@
+"""
+Awareness Agent Module for DelhiFix.
+
+Single Responsibility:
+  Generates an educational, empowering "Your Environmental Impact" message that connects 
+  the resident's specific civic grievance (e.g. garbage burning, pothole, water leak) 
+  to Delhi's broader environmental and public health crises.
+
+Inputs:
+  - Receives unstructured parameters: category, department, location, and complaint summary.
+
+Outputs:
+  - AwarenessResult: A structured Pydantic model containing:
+    * environmental_impact: A formatted 150-250 word statement.
+
+DelhiFix Pipeline Context:
+  Called towards the end of the new complaint path by the Coordinator Agent. 
+  It appends educational facts and local actions to the final user-facing report.
+"""
+
 # pyrefly: ignore [missing-import]
 from google.adk.agents import Agent
 # pyrefly: ignore [missing-import]
@@ -7,11 +27,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Design Decision:
+# Enforcing a structured Pydantic schema ensures that downstream components receive 
+# clean text in the expected format, preventing API responses from leaking raw markdown 
+# headers or conversational commentary into the environmental impact panel.
 class AwarenessResult(BaseModel):
     environmental_impact: str = Field(
         description="The detailed 'Your Environmental Impact' message (between 150-250 words) with pollution facts, what the resident achieved, and actionable next steps."
     )
 
+# Design Decision - Persona Specialization:
+# We instantiate a specialized Agent rather than using a single monolithic prompt in the coordinator.
+# This separates concerns, ensuring the main Drafting Agent focuses exclusively on official complaint letters,
+# while the Awareness Agent acts as an environmental educator.
+# Behavior: 
+# The agent dynamically synthesizes Delhi-specific statistics based on the category (garbage, dust, water) 
+# and returns a highly localized fact sheet and actionable next steps (like calling DPCC or Swachhata Swachh App).
 root_agent = Agent(
     name="awareness_agent",
     model="gemini-3.1-flash-lite",

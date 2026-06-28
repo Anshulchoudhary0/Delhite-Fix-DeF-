@@ -5,6 +5,50 @@
 # - The Gemini API key is loaded only from environment variables.
 # ==============================================================================
 
+"""
+Coordinator Agent Module for DelhiFix.
+
+Single Responsibility:
+  Coordinates the multi-agent execution pipeline for processing and submitting 
+  Delhi civic grievances. It acts as the central router (orchestrator) and DAG 
+  executor of the application.
+
+Inputs:
+  - CoordinatorInput: A Pydantic model containing:
+    * issue_description: Description of the civic issue (optional).
+    * location: Specific location/landmark in Delhi (optional).
+    * recent_reports: List of recently logged complaints for duplicate checking (optional).
+    * complaint_text: Original complaint text if requesting escalation (optional).
+    * days_pending: Number of days pending since filing, indicating escalation flow (optional).
+    * image_path: Local filepath of an uploaded image (optional).
+
+Outputs:
+  - CoordinatorResult: A Pydantic model containing:
+    * category: The classified category of the grievance.
+    * department: The responsible Delhi government department.
+    * verified_complaint_text: The final, professionally written complaint letter.
+    * mailto_link: Pre-filled mailto URL for email submission.
+    * is_duplicate: Boolean indicating whether a duplicate complaint was found.
+    * status_message: Friendly text describing the pipeline's outcome.
+    * original_text: Original Hindi/Hinglish text if translation was performed.
+    * visual_evidence: Extracted visual details from the vision agent.
+    * original_language: Detected original language (hindi/hinglish/english).
+    * urgency: Urgency classification level.
+    * environmental_impact: Contextual educational text mapping the complaint to Delhi's environment.
+
+DelhiFix Pipeline Context:
+  This agent acts as the gateway/orchestrator of the multi-agent system.
+  1. Multimodal Check: Calls Vision Agent if an image is provided.
+  2. Language Check: Calls Translation Agent if Hindi/Hinglish is detected.
+  3. Security & Quality Check: Invokes Guardrail validation on normalized input.
+  4. Routing:
+     - Escalation Path: Calls Escalation Agent.
+     - New Complaint Path: Runs Duplicate Check Agent & Classifier Agent in parallel.
+       * If duplicate: aborts early.
+       * If not duplicate: calls Drafting Agent, Verifier Agent (self-correction loop), and Awareness Agent.
+  5. Formatter: Compiles results, generates Gmail draft URLs, and yields structured output.
+"""
+
 import sys
 import os
 import asyncio
@@ -74,7 +118,21 @@ agent_runners = {}
 shared_session_service = InMemorySessionService()
 
 async def run_agent_helper(agent, prompt_or_parts: Any) -> Any:
-    """Helper to run an agent and return its structured output model or raw text with automatic retries on rate limits."""
+    """
+    Helper to execute a sub-agent.
+    
+    Design Decision:
+      1. Modular Isolation: Downstream agents are executed using their own runner instances 
+         and transient in-memory sessions to prevent cross-agent prompt pollution.
+      2. Resilience: Implements exponential backoff retry logic for transient errors 
+         (429, 503, RESOURCE_EXHAUSTED, UNAVAILABLE) to guarantee robust service 
+         delivery under heavy loads.
+      3. Strict Output Handling: Standardizes stripping markdown JSON fences before Pydantic parsing.
+    
+    Behavior:
+      Re-raises fatal errors (like invalid configurations or authentication issues) to halt 
+      the pipeline immediately, while retrying transient errors up to 5 times.
+    """
     # pyrefly: ignore [missing-import]
     from google.genai import types
     import asyncio
@@ -154,7 +212,7 @@ class CoordinatorAgent(BaseAgent):
 
     @override
     async def _run_async_impl(self, ctx: Any) -> AsyncGenerator[Event, None]:
-        # Parse inputs (could be JSON or plain text)
+        # Implementation: Initialize local variables to hold parsed inputs.
         issue_description = None
         location = None
         recent_reports = []
@@ -162,7 +220,8 @@ class CoordinatorAgent(BaseAgent):
         days_pending = None
         image_path = None
 
-        # Get raw input text from user content or session events
+        # Implementation: Try to extract raw user text input from the incoming context, 
+        # checking both the direct user_content and the historic session events.
         raw_text = ""
         if ctx.user_content:
             raw_text = extract_text_from_content(ctx.user_content)
@@ -174,11 +233,14 @@ class CoordinatorAgent(BaseAgent):
                     if raw_text:
                         break
         
-        # Try parsing raw_text as JSON
+        # Design & Behavior:
+        # The Gradio UI serializes inputs as a JSON string and sends them in a single call.
+        # If parsing succeeds, we unpack structured fields. If it fails, we assume
+        # the entire raw text is the issue description (graceful fallback for CLI/direct execution).
         if raw_text:
             raw_text = raw_text.strip()
             try:
-                # Strip markdown code blocks if present
+                # Strip markdown code blocks if present (common when LLMs draft input payloads)
                 cleaned = raw_text
                 if cleaned.startswith("```json"):
                     cleaned = cleaned[7:]
@@ -197,7 +259,6 @@ class CoordinatorAgent(BaseAgent):
                     days_pending = data.get("days_pending")
                     image_path = data.get("image_path")
             except Exception:
-                # Treat entire raw_text as issue_description
                 issue_description = raw_text
 
         # Variables to store extra outputs
@@ -205,7 +266,9 @@ class CoordinatorAgent(BaseAgent):
         visual_evidence = None
         original_language = "english"
 
-        # Check if there is an image in user content or recent events
+        # Implementation & Design:
+        # Multimodal extraction. Check if image bytes were passed inline in the content 
+        # parts (standard ADK pattern) or if a filepath was provided in the JSON payload.
         image_bytes = None
         mime_type = None
         
@@ -239,19 +302,23 @@ class CoordinatorAgent(BaseAgent):
             except Exception as e:
                 print(f"Error reading image file from path {image_path}: {e}")
 
-        # Check if the input text itself is a simulated photo input
+        # Design Decision - Visual Emulation:
+        # For testing or headless runs, simulated image inputs can be passed as text prefixed with '[PHOTO INPUT]:'.
+        # If detected, we unpack it as visual evidence and bypass the vision agent.
         simulated_photo = False
         text_for_sim = complaint_text if days_pending is not None else issue_description
         if text_for_sim and text_for_sim.strip().startswith("[PHOTO INPUT]:"):
             simulated_photo = True
             visual_evidence = text_for_sim.strip()[14:].strip()
-            # Use that description as the complaint text going into the rest of the pipeline
             if days_pending is not None:
                 complaint_text = visual_evidence
             else:
                 issue_description = visual_evidence
 
-        # (1) If image is uploaded, call vision_agent first
+        # Design Decision - Multimodal Decoupling:
+        # We invoke the vision_agent first to translate raw image bytes into a descriptive textual summary.
+        # This shields all subsequent text-based agents from needing multimodal inputs, making the pipeline
+        # modular, cheaper, and faster since only one model call handles the image.
         if image_bytes and not simulated_photo:
             # pyrefly: ignore [missing-import]
             from google.genai import types
@@ -262,7 +329,6 @@ class CoordinatorAgent(BaseAgent):
             vision_desc = await run_agent_helper(vision_agent, parts)
             if vision_desc:
                 visual_evidence = vision_desc.strip()
-                # Use description as the complaint text going into the rest of the pipeline
                 if days_pending is not None:
                     complaint_text = visual_evidence
                 else:
@@ -271,10 +337,14 @@ class CoordinatorAgent(BaseAgent):
         # Determine the text content to validate
         text_to_validate = complaint_text if days_pending is not None else issue_description
 
-        # (2) If contains Hindi/Hinglish (Devanagari \u0900–\u097F or Hinglish keywords), call translation_agent first
+        # Design Decision - Multilingual Input Management:
+        # Civic reports in Delhi are frequently written in Hindi (Devanagari) or Hinglish (Hindi written in Latin script).
+        # Normalizing the text to English early ensures that downstream agents (classifier, drafting, verifier) can 
+        # focus purely on English structure, enhancing accuracy and reducing context token sizes.
         import re
         is_hindi_hinglish = False
         if text_to_validate:
+            # Check for Devanagari range
             if re.search(r"[\u0900-\u097F]", text_to_validate):
                 is_hindi_hinglish = True
             else:
@@ -295,7 +365,11 @@ class CoordinatorAgent(BaseAgent):
                     issue_description = translated
                 text_to_validate = translated
         
-        # Run Guardrail validation
+        # Design Decision - Defensive Input Guardrails:
+        # We run the input through guardrail.py to catch abuse, spam, and non-civic inputs (e.g. recipes, code).
+        # This acts as a firewall, protecting the pipeline from executing expensive sub-agent calls on garbage input.
+        # Behavior: If guardrail validation fails, we immediately short-circuit the execution, return a polite
+        # rejection message in the output, and skip invoking any other agents.
         from guardrail import validate_report
         is_valid, rejection_reason = await validate_report(text_to_validate or "")
         
@@ -332,19 +406,29 @@ class CoordinatorAgent(BaseAgent):
             )
             return
 
-        # Determine path (Escalation vs New Complaint)
+        # Design Decision - Pipeline Branching:
+        # The coordinator routes requests based on whether it is a tracking/follow-up request (Escalation Path)
+        # or a brand new report (New Complaint Path).
         subject = ""
         body_text = ""
         gmail_link = ""
         to_email = "complaints@delhi.gov.in"
         if days_pending is not None:
-            # Escalation Path
+            # ──────────────────────────────────────────────────────────
+            # ESCALATION PATH
+            # ──────────────────────────────────────────────────────────
+            # Behavior: Invoked when the resident supplies a non-empty days_pending value.
+            # Routing: Calls escalation_agent to draft follow-up correspondence and recommend
+            # official follow-up bodies (like the local ward councillor or CPGRAMS).
             escalation_prompt = f"""
             Original Complaint: {complaint_text or ''}
             Days Pending: {days_pending}
             """
             escalation_result = await run_agent_helper(escalation_agent, escalation_prompt)
             
+            # Implementation Fallback:
+            # If the escalation agent fails, we fall back to a simple, safe default message 
+            # to avoid throwing exceptions, recommending Councillor action as standard.
             if escalation_result is None:
                 msg = f"Your complaint has been pending for {days_pending} days. Please follow up with your local ward office."
                 step = "Ward Councillor"
@@ -357,7 +441,6 @@ class CoordinatorAgent(BaseAgent):
 
             subject = f"Civic Grievance Follow-up (Pending {days_pending} days)"
             body_text = msg
-            # Ensure carriage returns (\r\n) are used for mailto body newlines
             msg_crlf = msg.replace("\r\n", "\n").replace("\n", "\r\n")
             mailto_link = f"mailto:{to_email}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(msg_crlf)}"
             gmail_link = f"https://mail.google.com/mail/?view=cm&fs=1&to={to_email}&su={urllib.parse.quote(subject)}&body={urllib.parse.quote(msg_crlf)}"
@@ -376,12 +459,17 @@ class CoordinatorAgent(BaseAgent):
                 "environmental_impact": None
             }
         else:
-            # New Complaint Path
-            # 1. Check for duplicates and 2. Classify (in parallel if checking duplicates)
+            # ──────────────────────────────────────────────────────────
+            # NEW COMPLAINT PATH
+            # ──────────────────────────────────────────────────────────
+            # Routing: Involves checking for duplicates, classifying routing, drafting, and self-correcting.
             is_duplicate = False
             duplicate_reason = ""
             classifier_result = None
 
+            # Design Decision - Concurrency Optimization:
+            # If recent reports exist, we run duplicate check and classification in parallel using asyncio.gather.
+            # This concurrency reduces latency significantly compared to sequential execution.
             if recent_reports:
                 duplicate_check_prompt = f"""
                 New Complaint Description: {issue_description or ''}
@@ -390,7 +478,6 @@ class CoordinatorAgent(BaseAgent):
                 """
                 classifier_prompt = f"Resident Report: {issue_description or ''}"
                 
-                # Run duplicate check and classification in parallel
                 duplicate_task = run_agent_helper(duplicate_check_agent, duplicate_check_prompt)
                 classifier_task = run_agent_helper(classifier_agent, classifier_prompt)
                 
@@ -400,10 +487,11 @@ class CoordinatorAgent(BaseAgent):
                     is_duplicate = getattr(duplicate_result, "is_duplicate", False)
                     duplicate_reason = getattr(duplicate_result, "reason", "")
             else:
-                # If no recent reports, skip duplicate check completely and run classifier
+                # Behavior: Skip duplicate check entirely if there are no recent complaints passed.
                 classifier_prompt = f"Resident Report: {issue_description or ''}"
                 classifier_result = await run_agent_helper(classifier_agent, classifier_prompt)
                 
+            # Behavior: If duplicate detected, short-circuit the drafting pipeline and notify the resident.
             if is_duplicate:
                 result_dict = {
                     "category": "unknown",
@@ -427,7 +515,7 @@ class CoordinatorAgent(BaseAgent):
                     department = getattr(classifier_result, "department", "unknown")
                     urgency = getattr(classifier_result, "urgency", "medium")
                     
-                # 3. Draft
+                # 3. Draft Complaint letter
                 draft_prompt = f"""
                 Classifier Output: Category={category}, Department={department}
                 Resident Report: {issue_description or ''}
@@ -440,7 +528,12 @@ class CoordinatorAgent(BaseAgent):
                 if draft_result is not None:
                     draft_text = getattr(draft_result, "draft_text", "")
                     
-                # 4. Verify & Self-Correct
+                # 4. Verify & Self-Correct (Critic-Generator Loop)
+                # Design Decision:
+                # Drafting quality varies. We feed the drafted output into verifier_agent.
+                # If verifier fails verification, we perform one redraft cycle, feeding the verifier's 
+                # constructive feedback back to the drafting_agent. This loop improves compliance 
+                # with department routing and formatting guidelines without hardcoding validation logic.
                 verify_prompt = f"""
                 Drafted Complaint: {draft_text}
                 Classifier Decision: Category={category}, Department={department}
@@ -454,7 +547,7 @@ class CoordinatorAgent(BaseAgent):
                     feedback = getattr(verify_result, "feedback", "")
                     
                 if not verified:
-                    # Redraft once
+                    # Redraft once with feedback
                     redraft_prompt = f"""
                     Classifier Output: Category={category}, Department={department}
                     Resident Report: {issue_description or ''}
@@ -468,7 +561,7 @@ class CoordinatorAgent(BaseAgent):
                     if redraft_result is not None:
                         draft_text = getattr(redraft_result, "draft_text", "")
                         
-                    # Verify final draft
+                    # Verify final draft after redrafting
                     final_verify_prompt = f"""
                     Drafted Complaint: {draft_text}
                     Classifier Decision: Category={category}, Department={department}
@@ -485,7 +578,6 @@ class CoordinatorAgent(BaseAgent):
                 else:
                     subj_category = category.title()
                 subject = f"Civic Complaint: {subj_category} at {location or 'Delhi'}"
-                # Ensure carriage returns (\r\n) are used for mailto body newlines
                 draft_text_crlf = draft_text.replace("\r\n", "\n").replace("\n", "\r\n")
                 mailto_link = f"mailto:{to_email}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(draft_text_crlf)}"
                 body_text = draft_text
@@ -495,7 +587,9 @@ class CoordinatorAgent(BaseAgent):
                 if not verified:
                     status_msg = "Complaint drafted but failed final verification. Please review before filing."
                     
-                # Call Awareness Agent for all drafted complaints (not just verified ones)
+                # Design Decision - Environmental Education Integration:
+                # We trigger the awareness_agent for all drafted complaints to output an educational
+                # fact sheet linking the grievance to Delhi's air quality and waste management crisis.
                 environmental_impact = None
                 awareness_prompt = f"Category: {category}\nDepartment: {department}\nLocation: {location or 'Delhi'}\nComplaint Summary: {issue_description or ''}"
                 awareness_result = await run_agent_helper(awareness_agent, awareness_prompt)
@@ -516,12 +610,11 @@ class CoordinatorAgent(BaseAgent):
                     "environmental_impact": environmental_impact
                 }
 
-        # Format output as a beautiful, premium markdown message instead of messy raw JSON
-        # Note: Avoid using non-ASCII emojis to prevent encoding crashes on Windows console outputs.
+        # Format output as a premium, highly formatted markdown report.
+        # Implementation Detail: Avoid using emojis that might crash Windows command shell encoding.
         if result_dict.get("is_duplicate"):
             markdown_content = f"[DUPLICATE DETECTED] **Duplicate Complaint Detected**\n\n{result_dict['status_message']}"
         elif days_pending is not None:
-            # Escalation path
             markdown_content = f"""### [Escalation Grievance Drafted]
  
 * **Status**: {result_dict['status_message']}
@@ -542,7 +635,6 @@ class CoordinatorAgent(BaseAgent):
 ```
 """
         else:
-            # New Complaint Path
             status_prefix = "[VERIFIED]" if result_dict["status_message"] == "Complaint verified and drafted successfully." else "[WARNING]"
             markdown_content = f"""### [Civic Complaint Drafted]
  
@@ -581,12 +673,12 @@ class CoordinatorAgent(BaseAgent):
         if original_language in ("hindi", "hinglish") and original_text:
             markdown_content += f"\n\nOriginal complaint (Hindi): {original_text}"
 
+        # Build output Events to communicate status back to the framework/runner
         # pyrefly: ignore [missing-import]
         from google.genai import types
         content_part = types.Part.from_text(text=markdown_content)
         model_content = types.Content(role="model", parts=[content_part])
         
-        # Validate output schema
         validated_output = self._validate_output_data(result_dict)
         
         yield Event(
@@ -599,6 +691,7 @@ class CoordinatorAgent(BaseAgent):
 
     @override
     async def _run_live_impl(self, ctx: Any) -> AsyncGenerator[Event, None]:
+        # Design decision: The pipeline relies on sequential API calls and is not designed for streaming.
         raise NotImplementedError("Live mode is not supported for coordinator_agent.")
         yield
 

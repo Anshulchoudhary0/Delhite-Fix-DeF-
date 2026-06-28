@@ -1,3 +1,27 @@
+"""
+Drafting Agent Module for DelhiFix.
+
+Single Responsibility:
+  Drafts formal, professional, and structured bureaucratic grievance letters 
+  to Delhi authorities based on issue classifications and resident descriptions.
+
+Inputs:
+  - Classifier decisions (Category, Department).
+  - Resident report details and Location.
+  - Visual evidence description (optional).
+  - Verifier feedback (optional, during redraft loops).
+
+Outputs:
+  - DraftedComplaint: A structured Pydantic model containing:
+    * channel: The recommended portal/app to file the complaint (e.g. MCD 311, DJB 1916).
+    * draft_text: The complete written letter formatted for the target department.
+
+DelhiFix Pipeline Context:
+  Invoked in the New Complaint Path after classification.
+  Collaborates with the Verifier Agent: if verification fails, the coordinator 
+  re-invokes this agent in a self-correction loop to patch the draft.
+"""
+
 # pyrefly: ignore [missing-import]
 from google.adk.agents import Agent
 # pyrefly: ignore [missing-import]
@@ -12,6 +36,9 @@ import os
 
 load_dotenv()
 
+# Design Decision:
+# Enforces a Pydantic structure that returns both the text of the formal complaint 
+# and the name of the submission channel (like the MCD 311 app or BSES portal).
 class DraftedComplaint(BaseModel):
     channel: str = Field(
         description="The recommended channel to file the complaint (e.g. MCD 311 App, BSES portal, etc.)"
@@ -20,13 +47,20 @@ class DraftedComplaint(BaseModel):
         description="The drafted complaint report formatted exactly as expected by the target channel."
     )
 
-# Load the civic routing skill
+# Design Decision - Channel Formatting via Skill:
+# Rather than hardcoding the formatting criteria or instructions for different filing channels
+# in the prompt, the agent uses the civic-routing-skill to inspect channel-specific expectations 
+# (e.g. character limits or required headers) and formats the output draft to match.
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 skill_path = os.path.join(project_root, "skills", "civic-routing-skill")
 civic_skill = load_skill_from_dir(skill_path)
 skill_toolset = SkillToolset(skills=[civic_skill])
 
+# Behavior:
+# When executing, the agent uses strict templates to generate letters with high bureaucratic compliance.
+# It handles redraft tasks by parsing feedback from the verifier agent (critic) and amending specific 
+# faults (such as missing landmarks or wrong department names) without losing the original context.
 root_agent = Agent(
     name="drafting_agent",
     model="gemini-3.1-flash-lite",

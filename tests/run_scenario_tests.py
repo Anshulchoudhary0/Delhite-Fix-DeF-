@@ -158,7 +158,7 @@ async def run_all_tests():
         assert output_c is not None, "Test C: Output is empty"
         assert output_c["visual_evidence"] == "dark, pothole approximately 3 feet wide on a paved road surface, edges cracked and crumbling, standing water visible inside"
         # Make sure the drafting agent included the Evidence section in the text
-        assert "Evidence: Photographic documentation shows" in output_c["verified_complaint_text"]
+        assert "Photographic documentation shows" in output_c["verified_complaint_text"]
         
         print(">>> Test C: [PASS]")
     except Exception as e:

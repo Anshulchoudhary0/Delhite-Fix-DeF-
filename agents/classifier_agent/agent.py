@@ -1,3 +1,26 @@
+"""
+Classifier Agent Module for DelhiFix.
+
+Single Responsibility:
+  Analyzes resident civic grievance reports to determine the issue category,
+  assign the responsible government department, and gauge urgency.
+
+Inputs:
+  - Unstructured resident complaint description.
+
+Outputs:
+  - CivicIssueClassification: A structured Pydantic model containing:
+    * category: Literal category (pothole, garbage, streetlight, water leak, etc.).
+    * department: Responsible municipal department (MCD, DJB, DPCC, BSES, etc.).
+    * urgency: Urgency rating (high, medium, low).
+    * reasoning: One-line explanation of the classification rationale.
+
+DelhiFix Pipeline Context:
+  Invoked in the New Complaint Path. Runs concurrently with the Duplicate Check Agent. 
+  Its classification outputs are used by the Drafting Agent (to format the letter) 
+  and the Verifier Agent (to check routing accuracy).
+"""
+
 # pyrefly: ignore [missing-import]
 from google.adk.agents import Agent
 # pyrefly: ignore [missing-import]
@@ -13,7 +36,10 @@ import os
 
 load_dotenv()
 
-# Structured output schema
+# Design Decision:
+# Enforcing a strict schema with Pydantic validation ensures that the classification 
+# outputs adhere to strict categories. The literal constraints block invalid categories, 
+# preventing subsequent drafting logic from breaking.
 class CivicIssueClassification(BaseModel):
     category: Literal["pothole", "garbage/sanitation", "streetlight", "water leakage", "illegal construction", "stray animal", "pollution/air quality", "other"] = Field(
         description="The category of the civic issue."
@@ -28,13 +54,21 @@ class CivicIssueClassification(BaseModel):
         description="A one-line explanation of the classification reasoning."
     )
 
-# Load the civic routing skill
+# Design Decision - Skill Toolset Isolation:
+# Rather than hardcoding the mapping between categories, urgency rules, and Delhi government 
+# departments in the agent instruction prompt, we load these rules dynamically from the 
+# 'civic-routing-skill' folder. This ensures the agent is modular and permits updating the 
+# routing/ownership matrix without modifying the underlying Python code or agent prompting.
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 skill_path = os.path.join(project_root, "skills", "civic-routing-skill")
 civic_skill = load_skill_from_dir(skill_path)
 skill_toolset = SkillToolset(skills=[civic_skill])
 
+# Behavior:
+# When executing, the agent queries the toolset to match the issue description against 
+# the department criteria, returns the structured schema using the set_model_response tool, 
+# and avoids raw conversational text.
 root_agent = Agent(
     name="classifier_agent",
     model="gemini-3.1-flash-lite",
